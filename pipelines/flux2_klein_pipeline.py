@@ -4,11 +4,12 @@ import inspect
 import numpy as np
 import PIL.Image
 
+from tqdm import tqdm
 from dataclasses import dataclass
 from diffusers.utils import BaseOutput
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.image_processor import VaeImageProcessor
-from ..models.flux2_model_wrapper import Flux2ModelWrapper
+from models.flux2_model_wrapper import Flux2ModelWrapper
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 
@@ -129,7 +130,6 @@ class Flux2UnifiedPipeline:
             self.output_type = output_type
 
         self.model: Flux2ModelWrapper = None
-        self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor * 2)
 
 
     def _get_qwen3_prompt_embeds(
@@ -189,6 +189,7 @@ class Flux2UnifiedPipeline:
     
 
     def _prepare_text_ids(
+        self,
         x: torch.Tensor,  # (B, L, D) or (L, D)
         t_coord: Optional[torch.Tensor] = None,
     ):
@@ -242,6 +243,7 @@ class Flux2UnifiedPipeline:
     
 
     def _prepare_latent_ids(
+        self,
         latents: torch.Tensor,  # (B, C, H, W)
     ):
         r"""
@@ -273,7 +275,7 @@ class Flux2UnifiedPipeline:
         return latent_ids
     
 
-    def _pack_latents(latents):
+    def _pack_latents(self, latents):
         """
         pack latents: (batch_size, num_channels, height, width) -> (batch_size, height * width, num_channels)
         """
@@ -318,7 +320,7 @@ class Flux2UnifiedPipeline:
         return latents, latent_ids
     
 
-    def _unpack_latents_with_ids(x: torch.Tensor, x_ids: torch.Tensor) -> list[torch.Tensor]:
+    def _unpack_latents_with_ids(self, x: torch.Tensor, x_ids: torch.Tensor) -> list[torch.Tensor]:
         """
         using position ids to scatter tokens into place
         """
@@ -344,17 +346,24 @@ class Flux2UnifiedPipeline:
         return torch.stack(x_list, dim=0)
     
 
-    def _unpatchify_latents(latents):
+    def _unpatchify_latents(self, latents):
         batch_size, num_channels_latents, height, width = latents.shape
         latents = latents.reshape(batch_size, num_channels_latents // (2 * 2), 2, 2, height, width)
         latents = latents.permute(0, 1, 4, 2, 5, 3)
         latents = latents.reshape(batch_size, num_channels_latents // (2 * 2), height * 2, width * 2)
         return latents
+    
+
+    def progress_bar(self, iterable=None, total=None):
+        if iterable is not None:
+            return tqdm(iterable, desc="Steps", leave=False)
+        return tqdm(total=total, desc="Steps", leave=False)
 
 
     @torch.no_grad()
     def __call__(
         self,
+        model: Flux2ModelWrapper,
         prompt: Union[str, List[str]] = None,
         height: Optional[int] = None,
         width: Optional[int] = None,
@@ -368,7 +377,13 @@ class Flux2UnifiedPipeline:
         text_encoder_out_layers: Tuple[int] = (9, 18, 27),
         output_type: Optional[str] = "pil",
         return_dict: bool = True,
+        latents: Optional[torch.Tensor] = None,
+        prompt_embeds: Optional[torch.Tensor] = None,
+        negative_prompt_embeds: Optional[Union[str, List[str]]] = None,
     ):
+        self.model = model
+        self.image_processor = VaeImageProcessor(vae_scale_factor=self.model.vae_scale_factor * 2)
+
         self._guidance_scale = guidance_scale
         self._attention_kwargs = attention_kwargs
         self._current_timestep = None
@@ -412,7 +427,10 @@ class Flux2UnifiedPipeline:
 
         # 4. process images
         pass
+        
 
+        height = height or self.model.default_sample_size * self.model.vae_scale_factor
+        width = width or self.model.default_sample_size * self.model.vae_scale_factor
 
         # 5. prepare latent variables
         num_channels_latents = self.model.transformer.config.in_channels // 4
@@ -462,9 +480,7 @@ class Flux2UnifiedPipeline:
         self.model.scheduler.set_begin_index(0)
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
-                if self.interrupt:
-                    continue
-
+                
                 self._current_timestep = t
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
                 timestep = t.expand(latents.shape[0]).to(latents.dtype)
@@ -480,7 +496,8 @@ class Flux2UnifiedPipeline:
                     noise_pred = self.model.transformer(
                         hidden_states=latent_model_input,  # (B, image_seq_len, C)
                         timestep=timestep / 1000,
-                        guidance=None,
+                        # guidance=None,
+                        guidance=torch.zeros_like(timestep),
                         encoder_hidden_states=prompt_embeds,
                         txt_ids=text_ids,  # B, text_seq_len, 4
                         img_ids=latent_image_ids,  # B, image_seq_len, 4
@@ -495,7 +512,8 @@ class Flux2UnifiedPipeline:
                         neg_noise_pred = self.model.transformer(
                             hidden_states=latent_model_input,
                             timestep=timestep / 1000,
-                            guidance=None,
+                            # guidance=None,
+                            guidance=torch.zeros_like(timestep),
                             encoder_hidden_states=negative_prompt_embeds,
                             txt_ids=negative_text_ids,
                             img_ids=latent_image_ids,
@@ -524,7 +542,7 @@ class Flux2UnifiedPipeline:
                 #     prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
 
                 # call the callback, if provided
-                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.model.scheduler.order == 0):
                     progress_bar.update()
 
         self._current_timestep = None

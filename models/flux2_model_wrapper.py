@@ -38,7 +38,7 @@ class Flux2ModelWrapper(Flux2LoraLoaderMixin):
         self.default_sample_size = 128
         self.is_distilled = getattr(self, "is_distilled", False)
 
-        print(f"✅ FluxModelWrapper loaded: {ckpt_path} ({'Klein' if self.model_type == 'klein' else 'Dev'})")
+        print(f"✅ FluxModelWrapper loaded: {self.ckpt_path} ({'Klein' if self.model_type == 'klein' else 'Dev'})")
 
     
     def load_hf_checkpoint(self):
